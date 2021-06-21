@@ -2,9 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
-	"fmt"
-	"io/ioutil"
 	"log"
 	"net/http"
 	"os"
@@ -17,9 +16,21 @@ type RequestBody struct {
 	Text string `json:"text,omitempty"`
 }
 
-func ExampleScrape(deeplClient *deepl.Client) {
-	// Request the HTML page.
-	res, err := http.Get("https://openaccess.thecvf.com/content/CVPR2021/html/Wu_Greedy_Hierarchical_Variational_Autoencoders_for_Large-Scale_Video_Prediction_CVPR_2021_paper.html")
+func main() {
+
+	deeplClient, err := deepl.New("https://api-free.deepl.com", nil)
+	if err != nil {
+		panic(err)
+	}
+
+	slackEndpoint := os.Getenv("SLACK_ENDPOINT")
+
+	scrape(deeplClient, slackEndpoint)
+}
+
+func scrape(deeplClient *deepl.Client, slackEndpoint string) {
+
+	res, err := http.Get("https://openaccess.thecvf.com/CVPR2021?day=all")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -34,15 +45,48 @@ func ExampleScrape(deeplClient *deepl.Client) {
 		log.Fatal(err)
 	}
 
-	// translateResponse, err := client.TranslateSentence(context.Background(), doc.Find("#abstract").Text(), "EN", "JA")
-	// if err != nil {
-	// 	fmt.Printf("Failed to translate text:\n   %+v\n", err)
-	// } else {
-	// 	fmt.Printf("%+v\n", translateResponse)
-	// }
+	doc.Find(".ptitle").Each(func(i int, s *goquery.Selection) {
+		// For each item found, get the title
+		link, exists := s.Find("a").Attr("href")
+		if !exists {
+			log.Fatal("link doesn't exist")
+		}
+		translateAbstract(link, deeplClient, slackEndpoint)
+	})
+}
 
+func translateAbstract(link string, deeplClient *deepl.Client, slackEndpoint string) {
+
+	baseURL := "https://openaccess.thecvf.com"
+
+	res, err := http.Get(baseURL + link)
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		log.Fatalf("status code error: %d %s", res.StatusCode, res.Status)
+	}
+
+	// Load the HTML document
+	doc, err := goquery.NewDocumentFromReader(res.Body)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	enAbstract := doc.Find("#abstract").Text()
+
+	translateResponse, err := deeplClient.TranslateSentence(context.Background(), enAbstract, "EN", "JA")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sendToSlack(translateResponse.Translations[0].Text, slackEndpoint)
+}
+
+func sendToSlack(abstract string, slackEndpoint string) {
 	body := &RequestBody{
-		Text: "Hello, World!",
+		Text: abstract,
 	}
 
 	jsonString, err := json.Marshal(body)
@@ -50,42 +94,15 @@ func ExampleScrape(deeplClient *deepl.Client) {
 		log.Fatal(err)
 	}
 
-	endpoint := os.Getenv("SLACK_ENDPOINT")
-	req, err := http.NewRequest("POST", endpoint, bytes.NewBuffer(jsonString))
+	req, err := http.NewRequest("POST", slackEndpoint, bytes.NewBuffer(jsonString))
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	req.Header.Set("Content-Type", "application/json")
-
 	client := &http.Client{}
-
-	resp, err := client.Do(req)
+	res, err := client.Do(req)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer resp.Body.Close()
-
-	byteArray, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		panic("Error")
-	}
-
-	fmt.Printf("%#v", string(byteArray))
-	// Find the review items
-	doc.Find("#abstract").Each(func(i int, s *goquery.Selection) {
-		// For each item found, get the title
-		title := s.Find("a").Text()
-		fmt.Printf("Review %d: %s\n", i, title)
-	})
-}
-
-func main() {
-
-	client, err := deepl.New("https://api-free.deepl.com", nil)
-	if err != nil {
-		fmt.Printf("Failed to create client:\n   %+v\n", err)
-	}
-
-	ExampleScrape(client)
+	defer res.Body.Close()
 }
