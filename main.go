@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -25,14 +26,27 @@ func main() {
 
 	slackEndpoint := os.Getenv("SLACK_ENDPOINT")
 
-	scrape(deeplClient, slackEndpoint)
+	if err := scrape(deeplClient, slackEndpoint); err != nil {
+		log.Fatal(err)
+	}
 }
 
-func scrape(deeplClient *deepl.Client, slackEndpoint string) {
+const baseURL = "https://openaccess.thecvf.com"
+const message = `
+[%d/1660]
+*%s*
+%s
+[<%s|abstract>] [<%s|pdf>]
+%s
+%s
+DeepL API quota: %d/500000
+`
+
+func scrape(deeplClient *deepl.Client, slackEndpoint string) error {
 
 	res, err := http.Get("https://openaccess.thecvf.com/CVPR2021?day=all")
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
@@ -42,26 +56,42 @@ func scrape(deeplClient *deepl.Client, slackEndpoint string) {
 	// Load the HTML document
 	doc, err := goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
-		log.Fatal(err)
+		return err
 	}
 
 	doc.Find(".ptitle").Each(func(i int, s *goquery.Selection) {
 		// For each item found, get the title
-		link, exists := s.Find("a").Attr("href")
+		relativePath, exists := s.Find("a").Attr("href")
 		if !exists {
 			log.Fatal("link doesn't exist")
 		}
-		translateAbstract(link, deeplClient, slackEndpoint)
+		title := s.Find("a").Text()
+
+		fullLink := baseURL + relativePath
+
+		enAbstract, jaAbstract, authors, pdfRelativePath, err := translateAbstract(fullLink, deeplClient)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		status, err := deeplClient.GetAccountStatus(context.TODO())
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		text := fmt.Sprintf(message, i+1, title, authors, fullLink, baseURL+pdfRelativePath, enAbstract, jaAbstract, status.CharacterCount)
+
+		sendToSlack(text, slackEndpoint)
 	})
+
+	return nil
 }
 
-func translateAbstract(link string, deeplClient *deepl.Client, slackEndpoint string) {
+func translateAbstract(link string, deeplClient *deepl.Client) (string, string, string, string, error) {
 
-	baseURL := "https://openaccess.thecvf.com"
-
-	res, err := http.Get(baseURL + link)
+	res, err := http.Get(link)
 	if err != nil {
-		log.Fatal(err)
+		return "", "", "", "", err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
@@ -71,22 +101,26 @@ func translateAbstract(link string, deeplClient *deepl.Client, slackEndpoint str
 	// Load the HTML document
 	doc, err := goquery.NewDocumentFromReader(res.Body)
 	if err != nil {
-		log.Fatal(err)
+		return "", "", "", "", err
 	}
 
+	authors := doc.Find("#authors").Find("b").Find("i").Text()
+	pdfRelativePath, exists := doc.Find("dd").Find("a").First().Attr("href")
+	if !exists {
+		log.Fatal("link doesn't exist")
+	}
 	enAbstract := doc.Find("#abstract").Text()
-
 	translateResponse, err := deeplClient.TranslateSentence(context.Background(), enAbstract, "EN", "JA")
 	if err != nil {
-		log.Fatal(err)
+		return "", "", "", "", err
 	}
 
-	sendToSlack(translateResponse.Translations[0].Text, slackEndpoint)
+	return enAbstract, translateResponse.Translations[0].Text, authors, pdfRelativePath, nil
 }
 
-func sendToSlack(abstract string, slackEndpoint string) {
+func sendToSlack(text string, slackEndpoint string) {
 	body := &RequestBody{
-		Text: abstract,
+		Text: text,
 	}
 
 	jsonString, err := json.Marshal(body)
